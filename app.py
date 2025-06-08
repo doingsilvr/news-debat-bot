@@ -47,10 +47,10 @@ if "start_time" not in st.session_state:
 
 # ==================== UI ====================
 try:
-    service_logo = Image.open("로고.png")
+    service_logo = Image.open("로고1.png")
     st.image(service_logo, width=100)
 except:
-    st.warning("로고 이미지를 불러올 수 없습니다. '로고.png' 파일을 확인해주세요.")
+    st.warning("로고 이미지를 불러올 수 없습니다. '로고1.png' 파일을 확인해주세요.")
 
 st.title("🗣️ 토론 메이트 - 오늘의 주제 한마디")
 st.markdown("""
