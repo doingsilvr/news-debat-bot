@@ -2,3 +2,5 @@ streamlit
 openai
 gspread
 oauth2client
+google-auth
+pillow
