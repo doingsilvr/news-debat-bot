@@ -7,10 +7,6 @@ import streamlit as st
 from openai import OpenAI
 
 
-# =====================
-# Page Config
-# =====================
-
 st.set_page_config(
     page_title="번역 평가 검수 자동화",
     page_icon="🔍",
@@ -18,17 +14,12 @@ st.set_page_config(
 )
 
 
-# =====================
-# Style
-# =====================
-
 st.markdown("""
 <style>
 .block-container {
     padding-top: 3rem;
     max-width: 1100px;
 }
-
 .metric-card {
     background: #F7F9FC;
     border: 1px solid #E5EAF2;
@@ -36,18 +27,15 @@ st.markdown("""
     padding: 22px;
     text-align: center;
 }
-
 .metric-num {
     font-size: 2.2rem;
     font-weight: 800;
     color: #2563EB;
 }
-
 .metric-label {
     color: #4B5563;
     font-size: 0.95rem;
 }
-
 .result-box {
     background: white;
     border: 1px solid #E5EAF2;
@@ -55,7 +43,6 @@ st.markdown("""
     padding: 18px;
     margin-bottom: 12px;
 }
-
 .logic-box {
     background: #F8FAFC;
     border-left: 4px solid #2563EB;
@@ -63,7 +50,6 @@ st.markdown("""
     padding: 14px 16px;
     margin-bottom: 12px;
 }
-
 .warning-box {
     background: #FFF7ED;
     border: 1px solid #FED7AA;
@@ -74,10 +60,6 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-
-# =====================
-# Helper Functions
-# =====================
 
 def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", str(text or "")).strip().lower()
@@ -93,13 +75,8 @@ def find_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
 
 def extract_json_from_cell(cell):
     text = str(cell or "").strip()
+    text = text.replace("```json", "").replace("```", "").strip()
 
-    # ```json ... ``` 형태 제거
-    text = text.replace("```json", "")
-    text = text.replace("```", "")
-    text = text.strip()
-
-    # 앞뒤에 불필요한 문자가 있을 경우 JSON 범위만 추출
     start = text.find("{")
     end = text.rfind("}")
 
@@ -112,6 +89,22 @@ def extract_json_from_cell(cell):
         return None
 
 
+def safe_parse_llm_json(content: str) -> dict:
+    text = str(content or "").strip()
+    text = text.replace("```json", "").replace("```", "").strip()
+
+    start = text.find("{")
+    end = text.rfind("}")
+
+    if start != -1 and end != -1:
+        text = text[start:end + 1]
+
+    try:
+        return json.loads(text)
+    except Exception:
+        return {"verdict": "X", "reason": "LLM 응답 JSON 파싱 실패로 보수적으로 X 처리"}
+
+
 def llm_fact_check(
     api_key: str,
     source: str,
@@ -121,31 +114,49 @@ def llm_fact_check(
     model: str = "gpt-4o-mini"
 ) -> Tuple[str, str]:
 
+    api_key = str(api_key or "").strip()
+
+    if not api_key:
+        return "O", "API Key가 없어 LLM 검수 미실행"
+
     client = OpenAI(api_key=api_key)
 
-    prompt = f"""
-You are a translation QA fact-checker.
+    payload = {
+        "source_ko": str(source),
+        "translation_en": str(translation),
+        "marked_text": str(marked_text),
+        "gemini_note": str(note),
+        "decision_rule": {
+            "return_O_only_if": [
+                "Gemini's note identifies a clear and material translation error.",
+                "The marked text clearly distorts the Korean source meaning.",
+                "The issue is not merely a stylistic preference or unnecessary alternative."
+            ],
+            "return_X_if": [
+                "The marked text is acceptable in context.",
+                "Gemini suggests an alternative expression but the current translation is also valid.",
+                "Gemini's note is not clearly supported by the Korean source and English translation.",
+                "Gemini over-corrects a grammatically acceptable expression.",
+                "The issue is only a preference, not a real translation error."
+            ]
+        },
+        "output_format": {
+            "verdict": "O or X",
+            "reason": "short Korean reason"
+        }
+    }
 
-Your task is to decide whether Gemini's error note is actually valid.
+    system_prompt = """
+You are a strict false-positive detector for translation QA.
 
-Return only JSON:
-{{"verdict":"O or X","reason":"short Korean reason"}}
+Your job is NOT to improve the translation.
+Your job is to judge whether Gemini's error note is truly valid.
 
-Definitions:
-- O: Gemini's error note is valid. The marked text contains a real translation error.
-- X: Gemini's error note is a false positive. The translation is acceptable, or Gemini's note is wrong.
+Be conservative about marking an error as valid.
+Return O only when the marked_text clearly contains a real translation error.
+Return X when the marked_text is acceptable, when Gemini over-corrects, or when Gemini's note is only a preference.
 
-Source Korean:
-{source}
-
-English translation:
-{translation}
-
-Marked text:
-{marked_text}
-
-Gemini note:
-{note}
+Return JSON only.
 """
 
     try:
@@ -154,24 +165,25 @@ Gemini note:
             messages=[
                 {
                     "role": "system",
-                    "content": "You are a precise translation QA reviewer. Return JSON only."
+                    "content": system_prompt
                 },
                 {
                     "role": "user",
-                    "content": prompt
+                    "content": json.dumps(payload, ensure_ascii=False)
                 }
             ],
             temperature=0,
         )
 
         content = response.choices[0].message.content
-        result = json.loads(content)
+        result = safe_parse_llm_json(content)
 
-        verdict = result.get("verdict", "O")
+        verdict = result.get("verdict", "X")
         reason = result.get("reason", "")
 
         if verdict not in ["O", "X"]:
-            verdict = "O"
+            verdict = "X"
+            reason = "LLM 판정값이 불명확하여 X 처리"
 
         return verdict, reason
 
@@ -246,7 +258,7 @@ def review_dataframe(
             else:
                 review_type = "유형2: LLM Fact Check"
 
-                if use_llm and api_key:
+                if use_llm:
                     final_verdict, reason = llm_fact_check(
                         api_key=api_key,
                         source=source,
@@ -257,7 +269,7 @@ def review_dataframe(
                     )
                 else:
                     final_verdict = "O"
-                    reason = "marked_text가 번역문에 존재하여 LLM 검수 대상이나, API 미사용으로 O 처리"
+                    reason = "marked_text가 번역문에 존재하여 LLM 검수 대상이나, LLM 검수 비활성화로 O 처리"
 
             results.append({
                 "segment_id": segment_id,
@@ -277,10 +289,6 @@ def review_dataframe(
     return pd.DataFrame(results)
 
 
-# =====================
-# Sidebar
-# =====================
-
 with st.sidebar:
     st.header("⚙️ 검수 설정")
 
@@ -292,7 +300,7 @@ with st.sidebar:
 
     use_llm = st.toggle(
         "유형2 LLM Fact Check 사용",
-        value=False
+        value=True
     )
 
     model_name = st.text_input(
@@ -321,10 +329,6 @@ Gemini Note의 판단 근거가 부적절하면<br>
 </div>
 """, unsafe_allow_html=True)
 
-
-# =====================
-# Main
-# =====================
 
 st.markdown("# 🔍 번역 평가 검수 자동화")
 st.markdown(
@@ -404,10 +408,6 @@ type2_false = int(
     ).sum()
 )
 
-
-# =====================
-# Result Summary
-# =====================
 
 st.markdown("### 📊 검수 결과 요약")
 
@@ -502,10 +502,6 @@ with f3:
     )
 
 
-# =====================
-# False Positive List
-# =====================
-
 st.markdown("### 📌 허위 오류 목록")
 
 false_df = result_df[result_df["final_verdict"] == "X"]
@@ -526,10 +522,6 @@ else:
             unsafe_allow_html=True
         )
 
-
-# =====================
-# Full Result
-# =====================
 
 st.markdown("### 🧾 전체 검수 결과")
 
