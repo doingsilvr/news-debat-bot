@@ -1,264 +1,395 @@
 import json
-import os
 import re
-from io import StringIO
-from typing import Any, Dict, List, Tuple
+from typing import Tuple
 
 import pandas as pd
 import streamlit as st
+from openai import OpenAI
 
-try:
-    from openai import OpenAI
-except Exception:
-    OpenAI = None
 
-st.set_page_config(page_title="AI Translation QA Review Dashboard", page_icon="🧪", layout="wide")
+st.set_page_config(
+    page_title="번역 평가 검수 자동화",
+    page_icon="🔍",
+    layout="wide"
+)
 
 st.markdown("""
 <style>
-.main {background-color: #FAFAFC;}
-.block-container {padding-top: 2rem; padding-bottom: 3rem;}
-.metric-card {background: white; border: 1px solid #E8E8EF; border-radius: 18px; padding: 18px 20px; box-shadow: 0 2px 10px rgba(27,31,44,.04);}
-.small-label {color:#6B7280; font-size:.88rem;}
-.big-number {font-size:2rem; font-weight:800; color:#4F35E8;}
-.insight-box {background:#F3F0FF; border:1px solid #D8D0FF; border-radius:16px; padding:18px 22px; margin-top:12px;}
-.step {background:white; border:1px solid #E8E8EF; border-radius:18px; padding:18px; text-align:center; min-height:125px;}
-.arrow {font-size:2rem; color:#9CA3AF; text-align:center; padding-top:35px;}
+.block-container {
+    padding-top: 3rem;
+    max-width: 1050px;
+}
+.metric-card {
+    background: #F7F9FC;
+    border: 1px solid #E5EAF2;
+    border-radius: 18px;
+    padding: 22px;
+    text-align: center;
+}
+.metric-num {
+    font-size: 2.2rem;
+    font-weight: 800;
+    color: #2563EB;
+}
+.metric-label {
+    color: #4B5563;
+    font-size: 0.95rem;
+}
+.result-box {
+    background: white;
+    border: 1px solid #E5EAF2;
+    border-radius: 16px;
+    padding: 18px;
+    margin-bottom: 12px;
+}
+.logic-box {
+    background: #F8FAFC;
+    border-left: 4px solid #2563EB;
+    border-radius: 12px;
+    padding: 14px 16px;
+    margin-bottom: 12px;
+}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("AI 번역 평가 결과 검수 자동화 PoC")
-st.caption("Gemini가 탐지한 번역 오류 중 허위 오류(false positive)를 Rule Check와 LLM Fact Check로 분류하는 운영자용 QA Dashboard")
 
-with st.expander("이 PoC의 목적", expanded=True):
-    st.markdown("""
-기존 번역 품질 평가 프로세스에서는 **AI가 탐지한 오류를 사람이 다시 검수**해야 했습니다.
-
-이 PoC는 사람이 반복적으로 확인하던 검수 업무를 줄이기 위해 다음 두 단계를 적용합니다.
-
-1. **Rule Check**: `marked_text`가 실제 번역문에 존재하는지 코드로 확인
-2. **LLM Fact Check**: 표현이 존재하는 경우에만, 오류 지적이 문법·맥락상 실제로 타당한지 확인
-""")
-
-st.markdown("### 1. 기존 업무 프로세스와 개선 프로세스")
-c1, a1, c2, a2, c3, a3, c4 = st.columns([1.2, .25, 1.2, .25, 1.2, .25, 1.2])
-with c1:
-    st.markdown('<div class="step"><b>HCX 번역</b><br><br><span class="small-label">한국어 원문을 영어로 번역</span></div>', unsafe_allow_html=True)
-with a1:
-    st.markdown('<div class="arrow">→</div>', unsafe_allow_html=True)
-with c2:
-    st.markdown('<div class="step"><b>Gemini 평가</b><br><br><span class="small-label">오류 후보를 JSON으로 출력</span></div>', unsafe_allow_html=True)
-with a2:
-    st.markdown('<div class="arrow">→</div>', unsafe_allow_html=True)
-with c3:
-    st.markdown('<div class="step"><b>자동 검수</b><br><br><span class="small-label">Rule Check + LLM Fact Check</span></div>', unsafe_allow_html=True)
-with a3:
-    st.markdown('<div class="arrow">→</div>', unsafe_allow_html=True)
-with c4:
-    st.markdown('<div class="step"><b>사람 최종 확인</b><br><br><span class="small-label">허위 오류 제거 후 정리</span></div>', unsafe_allow_html=True)
-
-st.divider()
-st.markdown("### 2. 파일 업로드")
-st.write("CSV에는 `segment_id`, `source`, `translation` 컬럼이 필요합니다. JSON에는 Gemini 평가 결과가 들어갑니다.")
-
-left, right = st.columns(2)
-with left:
-    csv_file = st.file_uploader("HCX 번역 결과 CSV 업로드", type=["csv"])
-with right:
-    json_file = st.file_uploader("Gemini 평가 결과 JSON 업로드", type=["json"])
-
-use_sample = st.toggle("샘플 데이터로 테스트하기", value=True)
-
-sample_csv = """segment_id,source,translation
-1,2024년 2월 이후 물가는 안정세를 보였다.,Since February 2024, inflation has shown signs of stabilization.
-2,상반기에는 MMF 수신의 큰 폭 증가로 단기자금 운용 규모가 확대되었다.,"In the first half of the year, short-term fund operations expanded due to a substantial increase in MMF deposits."
-3,지난해 12월 이후 미 국채금리는 큰 폭 하락하였다.,"Since December last year, U.S. Treasury yields have fallen significantly."
-4,상품수지는 흑자를 지속하였다.,The goods account continued to post a surplus.
-7,중소 지역은행의 유동성 리스크가 확대되었다.,Liquidity risks among small and medium-sized regional banks increased.
-"""
-
-sample_json = [
-    {"segment_id": 1, "errors": [{"category": "Accuracy", "subtype": "Meaning Accuracy", "severity": "Minor", "marked_text": "since February 2024", "note": "해당 표현은 원문의 기간 표현을 과도하게 특정함"}]},
-    {"segment_id": 2, "errors": [{"category": "Accuracy", "subtype": "Meaning Accuracy", "severity": "Minor", "marked_text": "rapidly", "note": "rapidly라는 과장된 표현이 사용되어 원문의 의미를 왜곡함"}]},
-    {"segment_id": 3, "errors": [{"category": "Style", "subtype": "Awkward Expression", "severity": "Minor", "marked_text": "since December last year", "note": "지난해 12월 이후는 since가 아니라 in December로 번역해야 함"}]},
-    {"segment_id": 4, "errors": [{"category": "Terminology", "subtype": "Term Choice", "severity": "Major", "marked_text": "goods trade", "note": "상품수지는 goods trade로 번역해야 함"}]},
-    {"segment_id": 7, "errors": [{"category": "Terminology", "subtype": "Term Choice", "severity": "Major", "marked_text": "medium and small regional banks", "note": "중소 지역은행은 medium and small regional banks로 번역해야 함"}]},
-]
+# =====================
+# Helper
+# =====================
 
 def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", str(text or "")).strip().lower()
 
-def load_translation_df() -> pd.DataFrame:
-    if use_sample:
-        return pd.read_csv(StringIO(sample_csv))
-    if csv_file is None:
-        return pd.DataFrame(columns=["segment_id", "source", "translation"])
-    return pd.read_csv(csv_file)
 
-def load_eval_json() -> List[Dict[str, Any]]:
-    if use_sample:
-        return sample_json
-    if json_file is None:
-        return []
-    return json.load(json_file)
+def find_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    cols = list(df.columns)
+    for c in candidates:
+        for col in cols:
+            if str(col).strip().lower() == c.lower():
+                return col
+    return None
 
-def flatten_errors(eval_data: List[Dict[str, Any]], translation_df: pd.DataFrame) -> pd.DataFrame:
-    records = []
-    translation_lookup = {str(row.get("segment_id")): row.get("translation", "") for _, row in translation_df.iterrows()}
-    source_lookup = {str(row.get("segment_id")): row.get("source", "") for _, row in translation_df.iterrows()}
 
-    for item in eval_data:
-        sid = str(item.get("segment_id"))
-        for err in item.get("errors", []):
-            marked_text = err.get("marked_text", "")
-            translation = translation_lookup.get(sid, "")
-            exists = normalize_text(marked_text) in normalize_text(translation)
-            records.append({
-                "segment_id": sid,
-                "source": source_lookup.get(sid, ""),
-                "translation": translation,
-                "category": err.get("category", ""),
-                "subtype": err.get("subtype", ""),
-                "severity": err.get("severity", ""),
-                "marked_text": marked_text,
-                "note": err.get("note", ""),
-                "rule_check": "존재" if exists else "미존재",
-                "rule_verdict": "O" if exists else "X",
-                "final_verdict": "O" if exists else "X",
-                "review_reason": "marked_text가 번역문에 존재하지 않아 허위 오류로 분류" if not exists else "LLM Fact Check 대상"
-            })
-    return pd.DataFrame(records)
-
-def llm_fact_check(row: pd.Series, model: str = "gpt-4o-mini") -> Tuple[str, str]:
-    if OpenAI is None:
-        return "O", "OpenAI 패키지가 설치되어 있지 않아 LLM 검수를 건너뜀"
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        return "O", "OPENAI_API_KEY가 없어 LLM 검수를 건너뜀"
-
+def llm_fact_check(
+    api_key: str,
+    source: str,
+    translation: str,
+    marked_text: str,
+    note: str,
+    model: str = "gpt-4o-mini"
+) -> Tuple[str, str]:
     client = OpenAI(api_key=api_key)
+
     prompt = f"""
 You are a translation QA fact-checker.
 
-Decide whether Gemini's error note is actually valid.
+Your task is to decide whether Gemini's error note is actually valid.
 
 Return only JSON:
 {{"verdict":"O or X","reason":"short Korean reason"}}
 
 Definitions:
 - O: Gemini's error note is valid. The marked text contains a real translation error.
-- X: Gemini's error note is false positive. The translation is acceptable or Gemini's note is wrong.
+- X: Gemini's error note is a false positive. The translation is acceptable, or Gemini's note is wrong.
 
 Source Korean:
-{row['source']}
+{source}
 
 English translation:
-{row['translation']}
+{translation}
 
 Marked text:
-{row['marked_text']}
+{marked_text}
 
 Gemini note:
-{row['note']}
+{note}
 """
+
     try:
         resp = client.chat.completions.create(
             model=model,
             messages=[
-                {"role": "system", "content": "You are a precise translation QA reviewer. Return JSON only."},
+                {
+                    "role": "system",
+                    "content": "You are a precise translation QA reviewer. Return JSON only."
+                },
                 {"role": "user", "content": prompt},
             ],
             temperature=0,
         )
-        result = json.loads(resp.choices[0].message.content)
+
+        content = resp.choices[0].message.content
+        result = json.loads(content)
+
         verdict = result.get("verdict", "O")
         reason = result.get("reason", "")
-        return (verdict if verdict in ["O", "X"] else "O"), reason
+
+        if verdict not in ["O", "X"]:
+            verdict = "O"
+
+        return verdict, reason
+
     except Exception as e:
-        return "O", f"LLM 검수 오류로 기본값 O 처리: {e}"
+        return "O", f"LLM 검수 실패로 기본값 O 처리: {e}"
+
+
+def review_dataframe(df: pd.DataFrame, api_key: str, use_llm: bool) -> pd.DataFrame:
+    source_col = find_col(df, ["source", "Source", "원문", "한국어 원문"])
+    translation_col = find_col(df, ["translation", "Translation", "번역문", "영어 번역문"])
+    marked_col = find_col(df, ["marked_text", "Marked Text", "지적 표현"])
+    note_col = find_col(df, ["note", "Note", "검수 내용", "오류 설명"])
+    segment_col = find_col(df, ["segment_id", "Segment", "segment", "번호"])
+
+    required = {
+        "translation": translation_col,
+        "marked_text": marked_col,
+        "note": note_col,
+    }
+
+    missing = [k for k, v in required.items() if v is None]
+    if missing:
+        st.error(f"필수 컬럼을 찾지 못했습니다: {missing}")
+        st.stop()
+
+    results = []
+
+    for idx, row in df.iterrows():
+        source = row[source_col] if source_col else ""
+        translation = row[translation_col]
+        marked_text = row[marked_col]
+        note = row[note_col]
+        segment_id = row[segment_col] if segment_col else idx + 1
+
+        exists = normalize_text(marked_text) in normalize_text(translation)
+
+        if not exists:
+            final_verdict = "X"
+            review_type = "유형1: Rule Check"
+            reason = "marked_text가 번역문에 존재하지 않아 허위 오류로 분류"
+        else:
+            review_type = "유형2: LLM Fact Check"
+
+            if use_llm and api_key:
+                final_verdict, reason = llm_fact_check(
+                    api_key=api_key,
+                    source=source,
+                    translation=translation,
+                    marked_text=marked_text,
+                    note=note,
+                )
+            else:
+                final_verdict = "O"
+                reason = "marked_text가 번역문에 존재하여 LLM 검수 대상이나, API 미사용으로 O 처리"
+
+        new_row = row.to_dict()
+        new_row.update({
+            "segment_id_review": segment_id,
+            "rule_check": "존재" if exists else "미존재",
+            "review_type": review_type,
+            "final_verdict": final_verdict,
+            "review_reason": reason,
+        })
+        results.append(new_row)
+
+    return pd.DataFrame(results)
+
+
+# =====================
+# Sidebar
+# =====================
 
 with st.sidebar:
-    st.header("검수 설정")
-    use_llm = st.checkbox("LLM Fact Check 사용", value=False)
-    model_name = st.text_input("OpenAI 모델명", value="gpt-4o-mini")
-    st.caption("LLM 검수를 사용하려면 실행 환경에 OPENAI_API_KEY가 설정되어 있어야 합니다.")
-    st.markdown("---")
-    st.markdown("**판정 기준**")
-    st.markdown("- O: 유효 오류")
-    st.markdown("- X: 허위 오류")
+    st.header("⚙️ 설정")
 
-translation_df = load_translation_df()
-eval_data = load_eval_json()
+    api_key = st.text_input(
+        "OpenAI API Key",
+        type="password",
+        placeholder="sk-..."
+    )
 
-if translation_df.empty or not eval_data:
-    st.warning("파일을 업로드하거나 샘플 데이터 테스트를 켜주세요.")
-    st.stop()
+    use_llm = st.toggle("유형2 LLM Fact Check 사용", value=False)
 
-review_df = flatten_errors(eval_data, translation_df)
+    st.divider()
 
-if st.button("자동 검수 실행", type="primary", use_container_width=True):
-    if use_llm:
-        for idx, row in review_df.iterrows():
-            if row["rule_verdict"] == "O":
-                verdict, reason = llm_fact_check(row, model=model_name)
-                review_df.at[idx, "final_verdict"] = verdict
-                review_df.at[idx, "review_reason"] = reason
-    st.session_state["review_df"] = review_df
-
-if "review_df" not in st.session_state:
-    st.info("자동 검수 실행 버튼을 눌러 결과를 확인하세요.")
-    st.stop()
-
-result_df = st.session_state["review_df"]
-total = len(result_df)
-valid_count = int((result_df["final_verdict"] == "O").sum())
-false_count = int((result_df["final_verdict"] == "X").sum())
-false_ratio = false_count / total * 100 if total else 0
-
-st.markdown("### 3. 검수 결과 요약")
-m1, m2, m3, m4 = st.columns(4)
-for col, label, value in [
-    (m1, "전체 오류 후보", f"{total}건"),
-    (m2, "유효 오류(O)", f"{valid_count}건"),
-    (m3, "허위 오류(X)", f"{false_count}건"),
-    (m4, "허위 오류 비율", f"{false_ratio:.1f}%"),
-]:
-    with col:
-        st.markdown(f'<div class="metric-card"><div class="small-label">{label}</div><div class="big-number">{value}</div></div>', unsafe_allow_html=True)
-
-st.markdown(f"""
-<div class="insight-box">
-<b>핵심 인사이트</b><br>
-전체 오류 후보 {total}건 중 <b>{false_count}건({false_ratio:.1f}%)</b>은 자동 검수 과정에서 허위 오류로 분류되었습니다.
-반복 검수 업무에서 사람이 확인해야 하는 후보군을 줄이는 데 활용할 수 있습니다.
+    st.subheader("검수 로직")
+    st.markdown("""
+<div class="logic-box">
+<b>유형1 (Rule)</b><br>
+<code>marked_text</code>가 번역문에 없으면<br>
+→ 허위 오류(X)
 </div>
 """, unsafe_allow_html=True)
 
-st.markdown("### 4. 오류 판정 분포")
-chart_df = pd.DataFrame({"판정": ["유효 오류(O)", "허위 오류(X)"], "건수": [valid_count, false_count]}).set_index("판정")
-st.bar_chart(chart_df)
+    st.markdown("""
+<div class="logic-box">
+<b>유형2 (LLM)</b><br>
+번역문에 존재하지만<br>
+Gemini Note의 판단 근거가 부적절하면<br>
+→ 허위 오류(X)
+</div>
+""", unsafe_allow_html=True)
 
-st.markdown("### 5. 상세 검수 결과")
-st.dataframe(
-    result_df[["segment_id", "category", "subtype", "severity", "marked_text", "rule_check", "final_verdict", "note", "review_reason"]],
-    use_container_width=True
+
+# =====================
+# Main
+# =====================
+
+st.markdown("# 🔍 번역 평가 검수 자동화")
+st.markdown(
+    "Gemini가 판정한 번역 오류 결과에서 **허위 오류(False Positive)** 를 자동으로 탐지합니다."
 )
 
-st.download_button(
-    "검수 결과 CSV 다운로드",
-    data=result_df.to_csv(index=False).encode("utf-8-sig"),
-    file_name="translation_qa_review_result.csv",
-    mime="text/csv",
-    use_container_width=True,
+st.markdown("### 📂 xlsx 파일 업로드")
+uploaded_file = st.file_uploader(
+    "번역 평가 결과 xlsx 파일을 업로드해주세요.",
+    type=["xlsx"]
 )
 
-st.markdown("### 6. 허위 오류 목록")
+if uploaded_file is None:
+    st.info("위에서 번역 평가 결과 xlsx 파일을 업로드해주세요.")
+    st.stop()
+
+xls = pd.ExcelFile(uploaded_file)
+sheet_name = st.selectbox("분석할 시트 선택", xls.sheet_names)
+df = pd.read_excel(uploaded_file, sheet_name=sheet_name)
+
+st.success(f"파일 업로드 완료: {len(df)}개 행을 불러왔습니다.")
+
+with st.expander("업로드 데이터 미리보기", expanded=False):
+    st.dataframe(df.head(10), use_container_width=True)
+
+if st.button("🚀 자동 검수 실행", type="primary", use_container_width=True):
+    result_df = review_dataframe(df, api_key=api_key, use_llm=use_llm)
+    st.session_state["result_df"] = result_df
+
+if "result_df" not in st.session_state:
+    st.stop()
+
+result_df = st.session_state["result_df"]
+
+total = len(result_df)
+false_count = int((result_df["final_verdict"] == "X").sum())
+valid_count = int((result_df["final_verdict"] == "O").sum())
+false_ratio = false_count / total * 100 if total else 0
+
+type1_count = int((result_df["review_type"] == "유형1: Rule Check").sum())
+type2_count = int((result_df["review_type"] == "유형2: LLM Fact Check").sum())
+
+st.markdown("### 📊 검수 결과 요약")
+
+m1, m2, m3, m4 = st.columns(4)
+
+with m1:
+    st.markdown(
+        f"""
+        <div class="metric-card">
+            <div class="metric-num">{total}</div>
+            <div class="metric-label">전체 오류 후보</div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+with m2:
+    st.markdown(
+        f"""
+        <div class="metric-card">
+            <div class="metric-num">{false_count}</div>
+            <div class="metric-label">허위 오류 탐지</div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+with m3:
+    st.markdown(
+        f"""
+        <div class="metric-card">
+            <div class="metric-num">{false_ratio:.1f}%</div>
+            <div class="metric-label">False Positive 비율</div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+with m4:
+    st.markdown(
+        f"""
+        <div class="metric-card">
+            <div class="metric-num">{valid_count}</div>
+            <div class="metric-label">유효 오류</div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+st.markdown("### 🧭 검수 흐름")
+
+flow1, flow2, flow3 = st.columns(3)
+
+with flow1:
+    st.markdown(
+        f"""
+        <div class="result-box">
+        <b>1. Rule Check</b><br><br>
+        marked_text 존재 여부 확인<br>
+        <b>{type1_count}건</b> Rule 기반 처리
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+with flow2:
+    st.markdown(
+        f"""
+        <div class="result-box">
+        <b>2. LLM Fact Check</b><br><br>
+        문맥·문법 타당성 확인<br>
+        <b>{type2_count}건</b> LLM 검수 대상
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+with flow3:
+    st.markdown(
+        f"""
+        <div class="result-box">
+        <b>3. Review Result</b><br><br>
+        허위 오류 자동 분류<br>
+        <b>{false_count}건</b> 제거 후보
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+st.markdown("### 📌 허위 오류 목록")
+
 false_df = result_df[result_df["final_verdict"] == "X"]
+
 if false_df.empty:
     st.success("허위 오류로 분류된 항목이 없습니다.")
 else:
     for _, row in false_df.iterrows():
-        with st.container(border=True):
-            st.markdown(f"**Segment {row['segment_id']} | marked_text: `{row['marked_text']}`**")
-            st.write(row["review_reason"])
-            st.caption(row["note"])
+        st.markdown(
+            f"""
+            <div class="result-box">
+                <b>Segment {row.get('segment_id_review')}</b><br>
+                <b>marked_text:</b> <code>{row.get('marked_text', '')}</code><br>
+                <b>검수 유형:</b> {row.get('review_type')}<br>
+                <b>판정 근거:</b> {row.get('review_reason')}
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+st.markdown("### 🧾 전체 검수 결과")
+st.dataframe(result_df, use_container_width=True)
+
+st.download_button(
+    "📥 검수 결과 CSV 다운로드",
+    data=result_df.to_csv(index=False).encode("utf-8-sig"),
+    file_name="translation_review_result.csv",
+    mime="text/csv",
+    use_container_width=True,
+)
