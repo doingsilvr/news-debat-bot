@@ -1,4 +1,3 @@
-
 import json
 import os
 import re
@@ -131,7 +130,6 @@ def flatten_errors(eval_data: List[Dict[str, Any]], translation_df: pd.DataFrame
     return pd.DataFrame(records)
 
 def llm_fact_check(row: pd.Series, model: str = "gpt-4o-mini") -> Tuple[str, str]:
-    """O=valid error, X=false positive."""
     if OpenAI is None:
         return "O", "OpenAI 패키지가 설치되어 있지 않아 LLM 검수를 건너뜀"
     api_key = os.getenv("OPENAI_API_KEY")
@@ -241,7 +239,10 @@ chart_df = pd.DataFrame({"판정": ["유효 오류(O)", "허위 오류(X)"], "�
 st.bar_chart(chart_df)
 
 st.markdown("### 5. 상세 검수 결과")
-st.dataframe(result_df[["segment_id", "category", "subtype", "severity", "marked_text", "rule_check", "final_verdict", "note", "review_reason"]], use_container_width=True)
+st.dataframe(
+    result_df[["segment_id", "category", "subtype", "severity", "marked_text", "rule_check", "final_verdict", "note", "review_reason"]],
+    use_container_width=True
+)
 
 st.download_button(
     "검수 결과 CSV 다운로드",
